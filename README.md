@@ -1,202 +1,98 @@
-# xLLM - CPU Optimized Inference Engine
+# xLLM - 高效大语言模型推理服务器
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+xLLM是一个高效的大语言模型推理服务器，支持批处理、量化和流式响应。
 
-xLLM is a CPU-optimized inference engine designed for large language models, supporting models like Qwen3 and DeepSeek R1. It provides efficient text generation capabilities with various sampling strategies and quantization options.
+## 功能特性
 
-## Features
+- ✅ 高效批处理调度
+- ✅ 多种量化支持 (int8, fp16)
+- ✅ 流式和非流式响应
+- ✅ 健康检查端点
+- ✅ 文本编码/解码功能
 
-- Pure CPU execution for broad hardware compatibility
-- Support for Qwen3, DeepSeek R1 and other models
-- Multiple sampling strategies (Greedy, Temperature, Top-K, Top-P, Beam Search, Contrastive Search)
-- Quantization support (INT8, FP16) for reduced memory usage
-- Continuous batching for improved throughput
-- RESTful API interface for easy integration
-- Streaming output support
-- Performance monitoring and logging
+## 系统要求
 
-## Architecture
+- Python 3.8+
+- PyTorch
+- Transformers
+- FastAPI
+- uvicorn
 
-The xLLM engine follows a layered architecture:
+## 快速开始
 
-```
-┌─────────────────┐
-│   HTTP Server   │ ← External Interface
-└─────────────────┘
-         │
-┌─────────────────┐
-│ Tokenizer Mgr   │ ← Tokenization & Request Management
-└─────────────────┘
-         │
-┌─────────────────┐
-│   Scheduler     │ ← Request Scheduling & Batching
-└─────────────────┘
-         │
-┌─────────────────┐
-│ Model Executor  │ ← Model Execution & Sampling
-└─────────────────┘
-```
-
-## Core Components
-
-### 1. HTTP Service Interface
-Handles external API requests and provides RESTful endpoints for text generation, tokenization, and model management.
-
-### 2. Tokenizer Manager
-Manages tokenization operations and coordinates requests between the HTTP interface and the scheduler.
-
-### 3. Scheduler
-Implements continuous batching and request prioritization to optimize throughput and latency.
-
-### 4. Model Executor
-Executes model inference on CPU with support for quantization and various sampling strategies.
-
-## Directory Structure
-
-```
-xllm/
-├── xllm_server.py     # HTTP服务接口
-├── tokenizer_manager.py # Tokenizer管理器
-├── scheduler.py        # 调度器
-├── model_executor.py   # 模型执行器
-├── sampler.py          # 采样器
-├── requirements.txt    # 依赖项
-├── setup.py           # 安装脚本
-├── model/             # 模型文件目录
-│   └── Qwen/
-│       └── Qwen3-0.6B/
-└── tests/             # 测试用例
-    ├── test_model_executor.py
-    ├── test_sampler.py
-    └── test_tokenizer_manager.py
-```
-
-## Installation
-
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-2. Install xLLM:
-```bash
-pip install -e .
-```
-
-## Usage
-
-### Starting the Server
-
-To start the xLLM server with a Qwen3 model:
+### 1. 启动服务器
 
 ```bash
-python xllm_server.py --model-path ./model/Qwen/Qwen3-0.6B --port 8000 --quantization fp16
+# 使用默认设置启动服务器
+./start_server.sh
+
+# 或者使用自定参数
+./start_server.sh --model-path ./model/Qwen/Qwen3-0.6B --port 8001 --quantization int8
 ```
 
-Parameters:
-- `--model-path`: Path to the model directory
-- `--port`: Server port (default: 8000)
-- `--quantization`: Quantization method (int8, fp16)
+### 2. API端点
 
-### API Endpoints
-
-#### Health Check
-```bash
-curl http://localhost:8000/health
+#### 健康检查
+```
+GET /health
 ```
 
-#### Text Encoding
+#### 文本生成
+```
+POST /generate
+```
+
+请求参数:
+- `prompt`: 输入文本 (string)
+- `messages`: 消息数组 (array, 可选)
+- `max_tokens`: 最大生成token数 (int, 默认100)
+- `temperature`: 温度参数 (float, 默认0.7)
+- `stream`: 是否流式输出 (bool, 默认false)
+
+示例请求:
 ```bash
-curl -X POST http://localhost:8000/encode \
+curl -X POST http://localhost:8001/generate \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello, world!"}'
+  -d '{
+    "prompt": "你好，世界！",
+    "max_tokens": 50,
+    "temperature": 0.7,
+    "stream": false
+  }'
 ```
 
-#### Text Generation
+#### 文本编码
+```
+POST /encode
+```
+
+请求参数:
+- `text`: 要编码的文本 (string)
+
+### 3. 使用客户端
+
 ```bash
-curl -X POST http://localhost:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello, how are you?", "max_tokens": 50, "temperature": 0.7}'
+python xllm_client.py
 ```
 
-#### Streaming Generation
+## 配置参数
+
+- `--model-path`: 模型路径 (必需)
+- `--port`: 服务器端口 (默认8001)
+- `--quantization`: 量化方式 (int8, fp16, 默认int8)
+- `--max-batch-size`: 最大批处理大小 (默认4)
+- `--max-context-length`: 最大上下文长度 (默认1024)
+- `--debug`: 启用调试模式
+
+## 停止服务器
+
 ```bash
-curl -X POST http://localhost:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Tell me a story", "max_tokens": 100, "stream": true}'
+./stop_server.sh
 ```
 
-### Model Quantization
+## 架构组件
 
-xLLM supports two quantization methods for CPU optimization:
-
-1. INT8 quantization: Reduces memory usage by approximately 50%
-2. FP16 quantization: Balances performance and memory usage
-
-To use quantization, specify the `--quantization` parameter when starting the server.
-
-## Performance Optimization
-
-xLLM implements several optimizations for CPU inference:
-
-- Continuous batching to improve throughput
-- Efficient memory management with KV cache
-- Radix-based prefix caching to reduce redundant computations
-- Optimized sampling algorithms for various strategies
-- Quantization support to reduce memory footprint
-
-## Testing
-
-Run unit tests:
-```bash
-python -m pytest tests/
-```
-
-## Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [Qwen](https://github.com/QwenLM/Qwen) for the amazing language model
-- [Hugging Face Transformers](https://github.com/huggingface/transformers) for the powerful library
-- All contributors who have helped make xLLM better
-
-## Citation
-
-If you use xLLM in your research, please cite:
-
-```bibtex
-@software{xllm2025,
-  title={xLLM: CPU Optimized Inference Engine for Large Language Models},
-  author={xLLM Contributors},
-  year={2025},
-  url={https://github.com/yourusername/xllm}
-}
-```
-
-## Roadmap
-
-- [ ] GPU support with CUDA
-- [ ] Multi-model serving
-- [ ] Advanced caching strategies
-- [ ] Distributed inference
-- [ ] Web UI interface
-- [ ] Model fine-tuning support
-
-## Support
-
-- 📖 [Documentation](docs/)
-- 🐛 [Issue Tracker](https://github.com/yourusername/xllm/issues)
-- 💬 [Discussions](https://github.com/yourusername/xllm/discussions)
-- 📧 Email: support@xllm.dev
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/xllm&type=Date)](https://star-history.com/#yourusername/xllm&Date)
+- **Scheduler**: 请求调度和批处理管理
+- **TokenizerManager**: 令牌化和流式生成管理
+- **ModelExecutor**: 模型推理执行器
+- **KVCache**: 键值缓存管理

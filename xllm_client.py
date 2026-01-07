@@ -59,7 +59,11 @@ class XLLMClient:
                 )
                 
                 if response.status_code == 200:
-                    return response.json()
+                    result = response.json()
+                    # 服务器可能返回 'text' 或 'generated_text' 字段，兼容两种情况
+                    if 'text' in result:
+                        result['generated_text'] = result['text']
+                    return result
                 else:
                     print(f"❌ 服务器返回错误: {response.status_code}")
                     print(f"错误信息: {response.text}")
@@ -81,6 +85,9 @@ class XLLMClient:
         params["prompt"] = prompt
         params["stream"] = True  # 确保启用流式
         
+        # 添加token计数器
+        self._token_count = 0
+        
         try:
             # 发送流式请求
             response = self.session.post(
@@ -101,7 +108,7 @@ class XLLMClient:
                     # 检查是否请求中断
                     if self.interrupt_requested:
                         print("\n✅ 生成已中断")
-                        return {"generated_text": full_text, "finish_reason": "interrupted"}
+                        return {"generated_text": full_text, "finish_reason": "interrupted", "token_count": self._token_count}
                     
                     if line.startswith('data: '):
                         data_str = line[6:]  # 移除 'data: ' 前缀
@@ -112,22 +119,15 @@ class XLLMClient:
                             if "token" in data:
                                 token_text = data["token"]
                                 full_text += token_text
+                                self._token_count += 1  # 增加token计数
                                 
                                 # 直接输出token，实现逐字追加效果
-                                #print(f"\r{chr(32) * 40}\r", end='')  # 清除进度信息
                                 print(token_text, end='', flush=True)
-                                
-                                # 添加轻微延迟，避免显示过快造成视觉混乱
-                                #time.sleep(0.01)
-                            elif "generated_text" in data and data.get("done"):
-                                # 完成消息
-                                print()  # 换行
-                                return {"generated_text": data["generated_text"], "finish_reason": data.get("finish_reason", "stop")}
                         except json.JSONDecodeError:
                             continue
                 
                 print()  # 换行
-                return {"generated_text": full_text}
+                return {"generated_text": full_text, "token_count": self._token_count}
             else:
                 print(f"❌ 服务器返回错误: {response.status_code}")
                 print(f"错误信息: {response.text}")
@@ -229,7 +229,7 @@ class XLLMClient:
                 if result:
                     print("\r" + " " * 40 + "\r", end='')  # 清除 "服务器正在生成回答..." 文本
                     
-                    # 提取生成的文本
+                    # 提取生成的文本和token数
                     if isinstance(result, dict):
                         if "generated_text" in result:
                             generated_text = result["generated_text"]
@@ -246,7 +246,20 @@ class XLLMClient:
                     
                     # 显示统计信息
                     response_time = end_time - start_time
-                    token_count = len(generated_text.split())
+                    
+                    # 改进token计数方式 - 尝试从结果中获取实际token数，如果没有则使用更准确的估算
+                    if isinstance(result, dict) and "token_count" in result:
+                        # 如果服务器返回了实际token数，使用它
+                        token_count = result["token_count"]
+                    elif streaming_enabled and hasattr(self, '_token_count'):
+                        # 对于流式输出，使用内部计数
+                        token_count = self._token_count
+                    else:
+                        # 估算token数 - 使用字符数除以平均token长度(中文约2字符/词，英文约4字符/词)
+                        # 更准确的估算：中文按每2字符算1个token，英文按每4字符算1个token
+                        # 这里使用一个简单但更准确的估算方法：总字符数除以3
+                        token_count = len(generated_text) // 3 + 1 if generated_text else 0
+                    
                     speed = token_count / response_time if response_time > 0 else 0
                     
                     print(f"📈 统计: {token_count} tokens, {response_time:.2f}s, {speed:.2f} tokens/s")

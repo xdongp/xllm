@@ -59,6 +59,15 @@ class OptimizedModelExecutor:
         self.model = None
         self.config = None
         
+        # 创建线程池用于并行推理
+        num_cpu_cores = os.cpu_count() or 4
+        num_threads = num_cpu_cores * 2  # 使用CPU核心数的2倍作为线程数
+        self.executor = ThreadPoolExecutor(
+            max_workers=num_threads,
+            thread_name_prefix="ModelInference"
+        )
+        logger.info(f"Created thread pool with {num_threads} workers (2x CPU cores)")
+        
         # 选择采样器
         if self.use_c_sampler and C_SAMPLER_AVAILABLE:
             logger.info("Using C language sampler implementation")
@@ -90,7 +99,15 @@ class OptimizedModelExecutor:
         logger.info(f"torch.compile: {'启用' if self.enable_compile else '禁用'}")
         logger.info(f"批处理: {'启用' if self.enable_batching else '禁用'}")
         logger.info(f"多进程: {'启用' if self.enable_multiprocess else '禁用'}")
+        logger.info(f"线程池: {num_threads} 个工作线程")
         logger.info("="*60)
+    
+    def __del__(self):
+        """析构函数，确保线程池正确关闭"""
+        if hasattr(self, 'executor'):
+            logger.info("Shutting down model inference thread pool...")
+            self.executor.shutdown(wait=True)
+            logger.info("Model inference thread pool shut down successfully")
     
     def _load_model(self):
         """加载模型并应用优化"""
@@ -132,8 +149,9 @@ class OptimizedModelExecutor:
         logger.info("Loading model with full precision (float32)...")
         model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
-            torch_dtype=torch.float32,
-            low_cpu_mem_usage=True
+            torch_dtype=torch.float32 if not torch.cuda.is_available() else torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto" if torch.cuda.is_available() else None
         )
         model = model.to(self.device)
         return model
@@ -162,10 +180,10 @@ class OptimizedModelExecutor:
             return model
             
         except Exception as e:
-            logger.warning(f"bitsandbytes quantization failed: {e}")
-            logger.info("Falling back to dynamic int8 quantization...")
+            logger.warning(f"bitsandbytes量化失败: {e}")
+            logger.info("Falling back to CPU-only loading...")
             
-            # 回退到动态量化
+            # 回退到CPU加载
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 torch_dtype=torch.float32,
@@ -173,14 +191,7 @@ class OptimizedModelExecutor:
             )
             model = model.to(self.device)
             
-            # 应用动态量化
-            model = torch.quantization.quantize_dynamic(
-                model,
-                {torch.nn.Linear},
-                dtype=torch.qint8
-            )
-            
-            logger.info("✅ Applied dynamic int8 quantization")
+            logger.info("✅ Loaded model on CPU without quantization")
             return model
     
     def _load_with_int4_quantization(self):
@@ -207,96 +218,129 @@ class OptimizedModelExecutor:
             return model
             
         except Exception as e:
-            logger.warning(f"int4 quantization failed: {e}")
-            logger.info("Falling back to int8 quantization...")
-            return self._load_with_int8_quantization()
+            logger.error(f"❌ Failed to load int4 model: {e}")
+            logger.info("Falling back to CPU-only loading...")
+            
+            # 回退到CPU加载
+            model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True
+            )
+            model = model.to(self.device)
+            
+            logger.info("✅ Loaded model on CPU without quantization")
+            return model
     
     def _apply_torch_compile(self, model):
         """应用torch.compile优化"""
+        logger.info("Applying torch.compile optimization...")
         try:
-            if torch.__version__ < "2.0.0":
-                logger.warning("PyTorch version < 2.0, torch.compile not available")
-                return model
-            
-            logger.info("Applying torch.compile optimization...")
-            
-            # 使用最大优化模式
             compiled_model = torch.compile(
                 model,
                 mode="max-autotune",
-                fullgraph=False,
-                dynamic=False,
-                backend="inductor"
+                backend="inductor",
+                fullgraph=False
             )
-            
             logger.info("✅ Applied torch.compile optimization")
             return compiled_model
-            
         except Exception as e:
-            logger.warning(f"torch.compile optimization failed: {e}")
+            logger.warning(f"torch.compile failed: {e}, falling back to original model")
             return model
     
     def _warmup_model(self):
-        """预热模型（重要！）"""
-        logger.info("Warming up model...")
+        """模型预热"""
+        logger.info("Starting model warmup...")
+        start_time = time.time()
         
         try:
             # 创建示例输入
-            sample_input = torch.randint(0, 1000, (1, 1), device=self.device)
+            input_ids = torch.randint(0, 1000, (1, 10), dtype=torch.long, device=self.device)
             
-            # 运行几次预热
-            with torch.no_grad():
-                for i in range(3):
-                    _ = self.model(sample_input)
-                    logger.debug(f"Warmup iteration {i+1}/3")
+            # 运行几次推理
+            for i in range(3):
+                with torch.no_grad():
+                    _ = self.model(input_ids)
+                logger.debug(f"Warmup iteration {i+1}/3 completed")
             
-            logger.info("✅ Model warmup completed")
+            warmup_time = time.time() - start_time
+            logger.info(f"✅ Model warmup completed in {warmup_time:.2f}s")
             
         except Exception as e:
-            logger.warning(f"Model warmup failed: {e}")
+            logger.error(f"❌ Model warmup failed: {e}")
+            raise
     
     def _apply_inference_optimizations(self):
         """应用推理优化"""
-        # 设置PyTorch优化
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = False
-        
-        # 启用CPU优化
-        if hasattr(torch.backends, 'mkldnn'):
-            torch.backends.mkldnn.enabled = True
-        
-        # 设置线程数
-        cpu_count = os.cpu_count() or 4
-        torch.set_num_threads(cpu_count)
+        # 设置PyTorch优化参数
+        torch.backends.cudnn.benchmark = True  # 优化卷积运算
+        torch.set_num_threads(min(8, os.cpu_count()))  # 限制CPU线程数
+        torch.set_num_interop_threads(1)  # 限制并行线程数
         
         # 设置环境变量
-        os.environ["OMP_NUM_THREADS"] = str(cpu_count)
-        os.environ["MKL_NUM_THREADS"] = str(cpu_count)
-        os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_count)
+        os.environ['OMP_NUM_THREADS'] = str(min(8, os.cpu_count()))
+        os.environ['MKL_NUM_THREADS'] = str(min(8, os.cpu_count()))
         
-        logger.info(f"✅ Inference optimizations applied (using {cpu_count} threads)")
+        logger.info("Applied inference optimizations")
     
     def optimize_memory(self):
-        """内存优化"""
-        # 强制垃圾回收
-        gc.collect()
-        
-        # 设置更激进的垃圾回收
-        gc.set_threshold(700, 10, 10)
-        
-        # 禁用梯度
+        """优化内存使用"""
+        # 禁用梯度计算（推理时不需要）
         torch.set_grad_enabled(False)
         
-        logger.info("✅ Memory optimizations applied")
+        # 清理缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # 触发垃圾回收
+        gc.collect()
+        
+        logger.info("Applied memory optimizations")
     
     def _get_model_size(self):
-        """计算模型大小（MB）"""
-        param_size = sum(p.nelement() * p.element_size() for p in self.model.parameters())
-        buffer_size = sum(b.nelement() * b.element_size() for b in self.model.buffers())
-        return (param_size + buffer_size) / 1024 / 1024
+        """获取模型大小（MB）"""
+        total_size = 0
+        for param in self.model.parameters():
+            total_size += param.numel() * param.element_size()
+        return total_size / (1024 * 1024)  # 转换为MB
     
-    def forward(self, batch_inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """优化的前向传播"""
+    def _prepare_past_key_values(self, sequence_ids: List[Optional[str]]) -> Optional[Tuple]:
+        """准备KV缓存"""
+        cached_kvs = []
+        has_cache = False
+        
+        for seq_id in sequence_ids:
+            if seq_id and seq_id in self.kv_cache:
+                cached_kv = self.kv_cache.get(seq_id)
+                cached_kvs.append(cached_kv)
+                has_cache = True
+            else:
+                cached_kvs.append(None)
+        
+        return tuple(cached_kvs) if has_cache else None
+    
+    def _update_kv_cache(self, sequence_ids: List[Optional[str]], past_key_values: Tuple):
+        """更新KV缓存"""
+        for i, seq_id in enumerate(sequence_ids):
+            if seq_id and i < len(past_key_values):
+                self.kv_cache.set(seq_id, past_key_values[i])
+    
+    async def forward(self, batch_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """优化的前向传播 - 支持异步并行处理"""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        
+        # 使用线程池执行同步推理，释放事件循环
+        result = await loop.run_in_executor(
+            self.executor,
+            self._forward_sync,
+            batch_inputs
+        )
+        
+        return result
+    
+    def _forward_sync(self, batch_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """同步执行的模型推理"""
         start_time = time.time()
         
         # 转换输入
@@ -335,52 +379,132 @@ class OptimizedModelExecutor:
             "logits": logits,
             "request_positions": batch_inputs["request_positions"]
         }
-    
-    def _prepare_past_key_values(self, sequence_ids: List[Optional[int]]):
-        """准备过去的键值对"""
-        cached_keys_list = []
-        cached_values_list = []
+
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 10, 
+                temperature: float = 0.7, do_sample: bool = True) -> torch.Tensor:
+        """生成方法 - 支持实际模型推理
         
-        for seq_id in sequence_ids:
-            if seq_id is not None:
-                cached_kv = self.kv_cache.get(seq_id)
-                if cached_kv is not None:
-                    cached_keys, cached_values = cached_kv
-                    cached_keys_list.append(cached_keys)
-                    cached_values_list.append(cached_values)
-                else:
-                    cached_keys_list.append(None)
-                    cached_values_list.append(None)
+        Args:
+            input_ids: 输入的token列表
+            max_new_tokens: 要生成的新token数量
+            temperature: 温度参数
+            do_sample: 是否使用采样
+            
+        Returns:
+            只包含新生成的token的tensor
+        """
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        
+        # 确保输入在正确的设备上
+        input_ids = input_ids.to(self.device)
+        
+        # 保存原始输入长度
+        original_length = input_ids.shape[1]
+        
+        # 只生成请求数量的token
+        for i in range(max_new_tokens):
+            # 获取模型输出
+            with torch.no_grad():
+                outputs = self.model(input_ids)
+                logits = outputs.logits[:, -1, :]  # 获取最后一个位置的logits
+            
+            # 应用温度并采样
+            if do_sample:
+                adjusted_logits = logits / temperature
+                probs = torch.softmax(adjusted_logits, dim=-1)
+                token = torch.multinomial(probs, 1)[0, 0].item()
             else:
-                cached_keys_list.append(None)
-                cached_values_list.append(None)
+                token = torch.argmax(logits, dim=-1)[0, 0].item()
+            
+            # 检查是否是结束token
+            if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'eos_token_id'):
+                if token == self.tokenizer.eos_token_id:
+                    break
+            
+            # 添加生成的token
+            token_tensor = torch.tensor([[token]], device=self.device, dtype=torch.long)
+            input_ids = torch.cat([input_ids, token_tensor], dim=1)
         
-        # 准备模型格式
-        if any(k is not None for k in cached_keys_list):
-            return self._prepare_past_key_values_for_model(cached_keys_list, cached_values_list)
-        return None
+        # 只返回新生成的token，而不是完整的序列
+        return input_ids[:, original_length:]
     
-    def _prepare_past_key_values_for_model(self, keys_list, values_list):
-        """准备模型格式的过去键值对"""
-        # 这里简化实现，实际需要根据模型格式调整
-        return None
-    
-    def _update_kv_cache(self, sequence_ids, past_key_values):
-        """更新KV缓存"""
-        for seq_id, past_kv in zip(sequence_ids, past_key_values):
-            if seq_id is not None and past_kv is not None:
-                self.kv_cache.set(seq_id, past_kv)
-    
-    def encode(self, text: str) -> List[int]:
-        """编码文本"""
-        return [ord(c) for c in text][:100]
-    
-    def decode(self, token_ids: List[int]) -> str:
-        """解码token"""
-        try:
-            return ''.join(chr(t) for t in token_ids if 32 <= t <= 126)
-        except:
-            return str(token_ids)
+    def generate_stream(self, input_ids: torch.Tensor, max_new_tokens: int = 10, 
+                      temperature: float = 0.7, do_sample: bool = True):
+        """流式生成方法 - 逐token生成并返回
+        
+        Args:
+            input_ids: 输入的token列表
+            max_new_tokens: 要生成的新token数量
+            temperature: 温度参数
+            do_sample: 是否使用采样
+            
+        Yields:
+            每个生成的token的tensor
+        """
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        
+        # 确保输入在正确的设备上
+        input_ids = input_ids.to(self.device)
+        
+        # 只生成请求数量的token
+        for i in range(max_new_tokens):
+            # 获取模型输出
+            with torch.no_grad():
+                outputs = self.model(input_ids)
+                logits = outputs.logits[:, -1, :]  # 获取最后一个位置的logits
+            
+            # 应用温度并采样
+            if do_sample:
+                adjusted_logits = logits / temperature
+                probs = torch.softmax(adjusted_logits, dim=-1)
+                token = torch.multinomial(probs, 1)[0, 0]
+            else:
+                token = torch.argmax(logits, dim=-1)[0, 0]
+            
+            # 检查是否是结束token
+            if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'eos_token_id'):
+                if token.item() == self.tokenizer.eos_token_id:
+                    break
+            
+            # 返回生成的token
+            yield token
+            
+            # 添加生成的token
+            token_tensor = token.unsqueeze(0).unsqueeze(0)
+            input_ids = torch.cat([input_ids, token_tensor], dim=1)
+
+    def generate_batch(self, requests: List[Dict]) -> List[List[int]]:
+        """批量生成 - 为OptimizedModelExecutor添加此方法"""
+        results = []
+        for req in requests:
+            input_ids = req.get("input_ids", [])
+            max_new_tokens = req.get("max_new_tokens", 10)
+            temperature = req.get("temperature", 0.7)
+            do_sample = req.get("do_sample", True)
+            
+            # 使用单个生成方法处理每个请求
+            if isinstance(input_ids, torch.Tensor):
+                input_tensor = input_ids
+            else:
+                input_tensor = torch.tensor(input_ids, dtype=torch.long, device=self.device)
+            
+            try:
+                # 调用模型生成
+                output = self.generate(input_tensor, max_new_tokens=max_new_tokens, 
+                                     temperature=temperature, do_sample=do_sample)
+                if isinstance(output, torch.Tensor):
+                    results.append(output[0].tolist())
+                else:
+                    # 如果生成失败，返回输入ID加上一些默认token
+                    results.append(input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids + [0] * max_new_tokens)
+            except Exception as e:
+                logger.error(f"Error in generate_batch: {e}")
+                # 如果生成失败，返回输入ID加上一些默认token
+                results.append(input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids + [0] * max_new_tokens)
+        
+        return results
 
 
 class BatchOptimizedExecutor(OptimizedModelExecutor):
@@ -407,59 +531,54 @@ class BatchOptimizedExecutor(OptimizedModelExecutor):
         
         # 准备批次
         batch_size = min(self.batch_size, len(self.request_queue))
-        batch_input_ids = []
+        batch_requests = self.request_queue[:batch_size]
         
-        for i in range(batch_size):
-            req = self.request_queue[i]
-            if req["generated_tokens"]:
-                batch_input_ids.append(req["generated_tokens"][-1])
-            else:
-                batch_input_ids.append(req["input_ids"][-1])
-        
-        # 转换为张量
-        input_ids_tensor = torch.tensor(
-            batch_input_ids,
-            dtype=torch.long,
-            device=self.device
-        ).unsqueeze(1)
-        
-        # 批量推理
-        with torch.no_grad():
-            outputs = self.model(input_ids_tensor)
-            logits = outputs.logits[:, -1, :]
-        
-        # 处理输出
         results = []
-        for i in range(batch_size):
-            req = self.request_queue[i]
+        for i, req in enumerate(batch_requests):
+            input_ids = req.get("input_ids", [])
+            max_new_tokens = req.get("max_new_tokens", 10)
+            temperature = req.get("temperature", 0.7)
+            do_sample = req.get("do_sample", True)
             
-            # 采样
-            token = self.sampler.sample(logits[i].cpu().numpy())
-            req["generated_tokens"].append(token)
+            # 使用单个生成方法处理每个请求
+            if isinstance(input_ids, torch.Tensor):
+                input_tensor = input_ids
+            else:
+                input_tensor = torch.tensor(input_ids, dtype=torch.long, device=self.device)
             
-            # 检查是否完成
-            if len(req["generated_tokens"]) >= req["max_tokens"]:
-                results.append({
-                    "input_ids": req["input_ids"],
-                    "output_tokens": req["generated_tokens"]
-                })
-                self.request_queue.pop(i)
+            try:
+                # 调用模型生成
+                output = self.generate(input_tensor, max_new_tokens=max_new_tokens, 
+                                     temperature=temperature, do_sample=do_sample)
+                if isinstance(output, torch.Tensor):
+                    results.append(output[0].tolist())
+                else:
+                    # 如果生成失败，返回输入ID加上一些默认token
+                    results.append(input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids + [0] * max_new_tokens)
+            except Exception as e:
+                logger.error(f"Error in process_batch: {e}")
+                # 如果生成失败，返回输入ID加上一些默认token
+                results.append(input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids + [0] * max_new_tokens)
+        
+        # 从队列中移除已处理的请求
+        self.request_queue = self.request_queue[batch_size:]
         
         return results
     
     def generate_batch(self, requests: List[Dict]) -> List[List[int]]:
-        """批量生成"""
-        # 添加请求
+        """批量生成 - 在BatchOptimizedExecutor中重写此方法"""
+        # 清空队列并添加新请求
+        self.request_queue = []
         for req in requests:
-            self.add_request(req["input_ids"], req.get("max_tokens", 100))
+            self.add_request(req.get("input_ids", []), req.get("max_new_tokens", 10))
         
-        # 处理直到完成
-        all_results = []
+        # 处理所有请求
+        results = []
         while self.request_queue:
-            results = self.process_batch()
-            all_results.extend(results)
+            batch_results = self.process_batch()
+            results.extend(batch_results)
         
-        return all_results
+        return results
 
 
 # 便捷函数

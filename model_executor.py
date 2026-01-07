@@ -9,22 +9,30 @@ import math
 import sys
 import os
 import time
-import logging
+import asyncio
 import threading
-from queue import Queue
+import concurrent.futures
+from typing import Dict, List, Optional, Any, Tuple
+import logging
 
-# 将父目录添加到路径中，以便我们可以从xllm包导入
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 设置日志
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+import torch
 from transformers import AutoModelForCausalLM, AutoConfig
-from xllm.sampler import Sampler
+import numpy as np
 
-# 导入C语言采样器
+# 导入采样器
+from sampler import Sampler
+
+# 检查C语言采样器是否可用
+C_SAMPLER_AVAILABLE = False
 try:
     from sampler_c import CSampler
     C_SAMPLER_AVAILABLE = True
 except ImportError:
-    C_SAMPLER_AVAILABLE = False
     logger.warning("C sampler not available, falling back to Python sampler")
 
 # 设置日志
@@ -63,22 +71,43 @@ class TransformerLayer(nn.Module):
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
     
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """前向传递"""
+    def forward(self, hidden_states: torch.Tensor, past_key_values=None) -> torch.Tensor:
+        """前向传递 - 支持增量注意力计算"""
         # 自注意力
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         
-        # 简化的注意力计算（仅用于演示）
+        # 计算查询、键和值
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         
-        # 简化的注意力分数计算
+        # 重塑张量以分离注意力头
+        batch_size = q.shape[0]
+        seq_length = q.shape[1]
+        
+        # 将q, k, v重塑为 (batch_size, num_heads, seq_length, head_dim)
+        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # 如果有past_key_values，将其与当前k和v连接
+        if past_key_values is not None:
+            past_k, past_v = past_key_values
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+        
+        # 计算注意力分数
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn_weights = torch.softmax(attn_scores, dim=-1)
+        
+        # 计算注意力输出
         attn_output = torch.matmul(attn_weights, v)
         
+        # 将注意力输出重塑回原始形状
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
+        
+        # 应用注意力输出投影
         hidden_states = self.o_proj(attn_output)
         hidden_states = residual + hidden_states
         
@@ -92,7 +121,8 @@ class TransformerLayer(nn.Module):
         
         hidden_states = residual + hidden_states
         
-        return hidden_states
+        # 返回输出和新的key_values
+        return hidden_states, (k, v)
 
 
 class ModelExecutor:
@@ -102,7 +132,7 @@ class ModelExecutor:
                  model_path: str, 
                  quantization: str = None, 
                  use_c_sampler: bool = False,
-                 enable_compile: bool = True,
+                 enable_compile: bool = False,  # 禁用torch.compile
                  warmup_iterations: int = 20):
         """
         初始化模型执行器
@@ -136,7 +166,23 @@ class ModelExecutor:
             self.sampler_type = "Python"
         
         # 设置CPU线程数以更好地利用多核
-        torch.set_num_threads(torch.get_num_threads())
+        # 获取系统CPU核心数
+        num_cpu_cores = os.cpu_count() or 4
+        logger.info(f"System CPU cores: {num_cpu_cores}")
+        
+        # 设置PyTorch线程数（推荐使用全部核心）
+        torch.set_num_threads(num_cpu_cores)
+        logger.info(f"PyTorch threads set to: {torch.get_num_threads()}")
+        logger.info(f"PyTorch interop threads: {torch.get_num_interop_threads()}")
+        
+        # 创建自定义线程池，用于模型推理
+        # 线程数设置为CPU核心数的4倍，以充分利用多核CPU
+        num_threads = num_cpu_cores * 4
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=num_threads,
+            thread_name_prefix="ModelInference"
+        )
+        logger.info(f"Created custom thread pool with {num_threads} workers (4x CPU cores)")
         
         # 初始化KV缓存
         from kv_cache import get_global_kv_cache
@@ -154,6 +200,15 @@ class ModelExecutor:
         
         # 预热模型
         self._warmup_model()
+    
+    def __del__(self):
+        """
+        析构函数，确保线程池正确关闭
+        """
+        if hasattr(self, 'executor'):
+            logger.info("Shutting down model inference thread pool...")
+            self.executor.shutdown(wait=True)
+            logger.info("Model inference thread pool shut down successfully")
     
     def _load_model(self):
         """从路径加载模型，可选择量化"""
@@ -176,6 +231,8 @@ class ModelExecutor:
                 self._load_with_int8_quantization()
             elif self.quantization == "int4":
                 self._load_with_int4_quantization()
+            elif self.quantization == "fp16":
+                self._load_with_fp16_quantization()
             else:
                 self._load_full_precision()
             
@@ -205,6 +262,18 @@ class ModelExecutor:
         self._optimize_model_for_speed(self.model)
         self.optimize_memory()
     
+    def _load_with_fp16_quantization(self):
+        """使用fp16半精度加载模型"""
+        logger.info("Loading model with fp16 quantization...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
+        )
+        self.model = self.model.to(self.device)
+        self._optimize_model_for_speed(self.model)
+        self.optimize_memory()
+    
     def _load_with_int8_quantization(self):
         """使用Int8量化加载模型"""
         if HAS_BNB:
@@ -221,13 +290,13 @@ class ModelExecutor:
                 self.optimize_memory()
             except Exception as e:
                 logger.warning(f"Failed to load model with int8 quantization: {e}")
-                logger.warning("Falling back to full precision")
-                self.quantization = None
-                self._load_full_precision()
+                logger.warning("Falling back to fp16")
+                self.quantization = "fp16"
+                self._load_with_fp16_quantization()
         else:
-            logger.warning("bitsandbytes not available, falling back to full precision")
-            self.quantization = None
-            self._load_full_precision()
+            logger.warning("bitsandbytes not available, falling back to fp16")
+            self.quantization = "fp16"
+            self._load_with_fp16_quantization()
     
     def _load_with_int4_quantization(self):
         """使用Int4量化加载模型"""
@@ -247,13 +316,13 @@ class ModelExecutor:
                 self.optimize_memory()
             except Exception as e:
                 logger.warning(f"Failed to load model with int4 quantization: {e}")
-                logger.warning("Falling back to full precision")
-                self.quantization = None
-                self._load_full_precision()
+                logger.warning("Falling back to fp16")
+                self.quantization = "fp16"
+                self._load_with_fp16_quantization()
         else:
-            logger.warning("bitsandbytes not available, falling back to full precision")
-            self.quantization = None
-            self._load_full_precision()
+            logger.warning("bitsandbytes not available, falling back to fp16")
+            self.quantization = "fp16"
+            self._load_with_fp16_quantization()
     
     def _apply_torch_compile(self):
         """应用torch.compile优化"""
@@ -318,14 +387,28 @@ class ModelExecutor:
                 self.lm_head = nn.Linear(512, 32000, bias=False)
             
             def forward(self, input_ids, **kwargs):
+                past_key_values = kwargs.get('past_key_values', None)
                 hidden_states = self.embed_tokens(input_ids)
-                for layer in self.layers:
-                    hidden_states = layer(hidden_states)
+                
+                new_past_key_values = []
+                for i, layer in enumerate(self.layers):
+                    if past_key_values is not None and i < len(past_key_values):
+                        layer_past = past_key_values[i]
+                    else:
+                        layer_past = None
+                    
+                    hidden_states, layer_past = layer(hidden_states, past_key_values=layer_past)
+                    new_past_key_values.append(layer_past)
+                
                 hidden_states = self.norm(hidden_states)
                 logits = self.lm_head(hidden_states)
-                if 'past_key_values' in kwargs and kwargs['past_key_values'] is not None:
-                    return type('obj', (object,), {'logits': logits, 'past_key_values': kwargs['past_key_values']})()
-                return type('obj', (object,), {'logits': logits})()
+                
+                # 创建一个具有logits和past_key_values属性的对象
+                output = type('obj', (object,), {
+                    'logits': logits,
+                    'past_key_values': new_past_key_values
+                })()
+                return output
         
         return PlaceholderModel()
     
@@ -402,6 +485,21 @@ class ModelExecutor:
             Dictionary containing output logits and metadata
         """
         logger.debug(f"ModelExecutor.forward called with batch_size={batch_inputs['batch_size']}")
+        
+        # 使用自定义线程池执行模型推理，释放事件循环
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            self.executor,  # 使用自定义的线程池
+            self._forward_sync,  # 同步执行的模型推理函数
+            batch_inputs  # 传递参数
+        )
+        
+        return result
+    
+    def _forward_sync(self, batch_inputs: Dict) -> Dict:
+        """
+        同步执行的模型推理
+        """
         start_time = time.time()
         
         input_ids = torch.tensor(batch_inputs["input_ids"], dtype=torch.long, device=self.device)
@@ -670,8 +768,32 @@ class BatchOptimizedExecutor:
         results = {}
         processed = self.process_batch(batch)
         
-        for result in processed:
-            results[result['request_id']] = result['logits']
+        # 使用批量采样优化
+        if processed and len(processed) > 0:
+            # 收集logits和温度参数
+            logits_batch = []
+            temperatures = []
+            request_ids = []
+            
+            for result in processed:
+                logits_batch.append(torch.tensor(result['logits']))
+                temperatures.append(result.get('temperature', 0.7))  # 默认温度0.7
+                request_ids.append(result['request_id'])
+            
+            # 转换为Tensor批处理
+            logits_batch_tensor = torch.stack(logits_batch)
+            
+            # 使用批量采样方法
+            sampled_tokens = self.executor.sampler.sample_batch_optimized(
+                logits_batch_tensor, 
+                temperatures,
+                top_p=result.get('top_p', 0.9),
+                top_k=result.get('top_k', 50)
+            )
+            
+            # 收集结果
+            for request_id, token in zip(request_ids, sampled_tokens):
+                results[request_id] = [token]
         
         return results
     

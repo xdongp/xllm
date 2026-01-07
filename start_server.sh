@@ -2,7 +2,6 @@
 
 # xLLM 启动脚本
 # 版本: v4.0
-# 优化程度: 250%性能提升
 # 作者: xLLM Team
 
 # 颜色定义
@@ -91,13 +90,32 @@ check_environment() {
         echo -e "${RED}❌ 错误: 未找到 python3${NC}" >&2
         return 1
     fi
-    echo -e "${GREEN}✓ python3 已找到$(python3 --version)${NC}"
+    echo -e "${GREEN}✓ python3 已找到: $(python3 --version)${NC}"
+    
+    # 检查是否在虚拟环境中
+    if [[ "$VIRTUAL_ENV" != "" ]]; then
+        echo -e "${GREEN}✓ 虚拟环境已激活: $VIRTUAL_ENV${NC}"
+    else
+        # 尝试激活虚拟环境
+        if [ -f ".venv/bin/activate" ]; then
+            echo -e "${YELLOW}⚠️  虚拟环境未激活，正在激活...${NC}"
+            source .venv/bin/activate
+            echo -e "${GREEN}✓ 虚拟环境已激活: $VIRTUAL_ENV${NC}"
+        elif [ -f "venv/bin/activate" ]; then
+            echo -e "${YELLOW}⚠️  虚拟环境未激活，正在激活...${NC}"
+            source venv/bin/activate
+            echo -e "${GREEN}✓ 虚拟环境已激活: $VIRTUAL_ENV${NC}"
+        else
+            echo -e "${YELLOW}⚠️  未找到虚拟环境，使用系统 Python${NC}"
+        fi
+    fi
     
     # 检查依赖
     python3 -c "import torch; import transformers; import fastapi; import uvicorn" 2>/dev/null
     if [ $? -ne 0 ]; then
         echo -e "${RED}❌ 错误: 缺少必要的Python依赖${NC}" >&2
         echo -e "${YELLOW}提示: 运行 'pip install torch transformers fastapi uvicorn' 安装依赖${NC}"
+        echo -e "${YELLOW}或者先激活虚拟环境: source .venv/bin/activate${NC}"
         return 1
     fi
     echo -e "${GREEN}✓ Python依赖已找到${NC}"
@@ -182,6 +200,17 @@ start_server() {
     echo -e "${GREEN}调试模式: $(if [ "$DEBUG_MODE" = true ]; then echo "启用"; else echo "禁用"; fi)${NC}"
     echo ""
     
+    # 创建日志目录
+    LOG_DIR="./logs"
+    mkdir -p "$LOG_DIR"
+    
+    # 生成日志文件名（包含时间戳）
+    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+    LOG_FILE="$LOG_DIR/server_${TIMESTAMP}.log"
+    
+    echo -e "${GREEN}日志文件: $LOG_FILE${NC}"
+    echo ""
+    
     # 构建启动命令
     CMD="python3 xllm_server.py --model-path $MODEL_PATH --port $PORT --quantization $QUANTIZATION"
     if [ "$DEBUG_MODE" = true ]; then
@@ -189,10 +218,12 @@ start_server() {
     fi
     
     echo -e "${BLUE}执行命令: $CMD${NC}"
+    echo -e "${BLUE}日志输出: $LOG_FILE${NC}"
+    echo -e "${YELLOW}提示: 可以使用 'grep \"\[SCHEDULER\]\" $LOG_FILE' 查看调度器日志${NC}"
     echo ""
     
-    # 启动服务器
-    eval $CMD
+    # 启动服务器，同时输出到终端和日志文件
+    eval $CMD 2>&1 | tee "$LOG_FILE"
 }
 
 # 主函数
